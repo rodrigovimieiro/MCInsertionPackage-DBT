@@ -53,13 +53,15 @@ def array2D_from_array1D(y, kind='cubic'):
     return img_2D, f
 
 # Values from NHS Breast Screening Programme Equipment Report
-mtf = np.array((1, 0.84, 0.66, 0.47, 0.32, 0.22, 0.15, 0.11, 0.09, 0.09, 0.08))
+# mtf = np.array((1, 0.84, 0.66, 0.47, 0.32, 0.22, 0.15, 0.11, 0.09, 0.09, 0.08)) # Pristina
+
+mtf = np.array((1, 0.95, 0.90, 0.85, 0.80, 0.75, 0.71, 0.67, 0.63, 0.59, 0.55, 0.52, 0.48, 0.44, 0.40))
 
 # plt.plot(mtf)
 
 mtf_2d, f = array2D_from_array1D(np.hstack((mtf[-1:0:-1],mtf)))
 
-np.save("mtf_function_ffdm_pristina_fourier.npy", f)
+np.save("../data/mtf_function_hologic3d_fourier.npy", f)
 
 
 
