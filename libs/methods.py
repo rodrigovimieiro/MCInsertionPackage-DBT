@@ -37,6 +37,17 @@ def get_projection_cluster_mask(roi_3D, contrasts_individual, geo, x_clust, y_cl
     
     if flags['print_debug']:
         print("Inserting cluster at position and projecting the cluster mask...")
+
+    # Backup
+    geo_nx = geo.nx
+    geo_ny = geo.ny
+    geo_nz = geo.nz
+
+    geo_dx = geo.dx
+    geo_dy = geo.dy
+    geo_dz = geo.dz
+
+    geo_DAG = geo.DAG
     
     # We add an offset to the airgap so we dont need to project the
     # slices that dont have information.
@@ -62,6 +73,8 @@ def get_projection_cluster_mask(roi_3D, contrasts_individual, geo, x_clust, y_cl
     
     calc_out = 0
     for idX, contrast_individual in enumerate(contrasts_individual):
+
+        print("Processing calc {}/{}...".format(idX + 1, len(contrasts_individual)))
         
         # Create a empty volume specific for that part (calcification cluster)
         vol = np.zeros((geo.ny, geo.nx, geo.nz))
@@ -86,15 +99,28 @@ def get_projection_cluster_mask(roi_3D, contrasts_individual, geo, x_clust, y_cl
     
     if flags['flip_projection_angle']:
         projs_masks = np.flip(projs_masks, axis=-1)
-    
+
+    # Refresh backup
+    geo.nx = geo_nx
+    geo.ny = geo_ny
+    geo.nz = geo_nz
+
+    geo.dx = geo_dx
+    geo.dy = geo_dy
+    geo.dz = geo_dz
+
+    geo.DAG = geo_DAG
+
     return projs_masks
 
 #-----------------------------------------------------------------------------#
 #                                                                             #
 #-----------------------------------------------------------------------------#
 
-def get_XYZ_cluster_positions(final_mask, bdyThick, buildDir, flags):
-    
+def get_XYZ_cluster_positions(final_mask, mask_breast, bdyThick, buildDir, flags):
+
+    denseThreshold = 0.4
+
     if flags['print_debug']:
         print("Reconstructing density mask and generate random coords for cluster...")
     
@@ -103,32 +129,77 @@ def get_XYZ_cluster_positions(final_mask, bdyThick, buildDir, flags):
     
     # Create a DBT geometry  
     geo = geometry_settings()
-    geo.GE()
+    geo.Hologic()
+
+    cluster_pixel_size = int(20 / 0.140)
+    how2pad = cluster_pixel_size//2
     
     # Find the X boundary
-    bound_X = int(np.where(np.sum(final_mask[:,:,4], axis=0) > 1)[0][0]) - 30
+    inds_bound = np.where(np.sum(mask_breast[7], axis=0) > 1)[0]
+    if inds_bound.shape[0]:
+        bound_X = inds_bound[0] - how2pad
+    else:
+        return ([], [], []), geo, libFiles, 0, np.zeros((geo.nu, geo.nv))
+
     
     # Crop to save reconstruction time
     final_mask = final_mask[:,bound_X:,:]
+    mask_breast = np.stack(mask_breast, axis=-1)
+    mask_breast = mask_breast[:, bound_X:, :]
     
     geo.nx = final_mask.shape[1]      # number of voxels (columns)
     geo.ny = final_mask.shape[0]      # number of voxels (rows)
     geo.nu = final_mask.shape[1]      # number of pixels (columns)
     geo.nv = final_mask.shape[0]      # number of pixels (rows)
     geo.nz = np.ceil(bdyThick/geo.dz).astype(int)
+
+    geo.dy = 0.14
+    geo.dx = 0.14
+
+    geo.detAngle = 0
     
     vol = backprojectionDDb_cuda(np.float64(final_mask), geo, -1, libFiles)
-        
-    # Avoid cluster on top or bottom 
-    vol[:,:,-(geo.nz//4):] = 0
-    vol[:,:,:(geo.nz//4)] = 0
-            
-    # Ramdomly selects one of the possible points
-    i,j,k = np.where(vol>0.5)
-    randInt = np.random.randint(0,i.shape[0])
-    y_pos, x_pos, z_pos = (i[randInt],j[randInt],k[randInt])
+    vol_mask = backprojectionDDb_cuda(np.float64(mask_breast), geo, -1, libFiles)
+
+    slice2check = vol[..., geo.nz//2].copy()
+    slice2check_mask = vol_mask[..., geo.nz // 2].copy()
+
+    del vol, vol_mask
+
+    slice2check_bool = slice2check > denseThreshold
+    slice2check_mask_bool = slice2check_mask > 0.01
+
+    x_pos, y_pos = [], []
+
+    # slice2check_bool_copy = 255*np.uint8(slice2check_bool)
+    # slice2check_bool_copy = np.stack((slice2check_bool_copy,) * 3, axis=-1)
+
+    # Define the stride based on the overlap
+    stride = int(cluster_pixel_size * (1 - 0))
+    mysums = []
+    npixelsroi = cluster_pixel_size ** 2
+    height, width = slice2check_bool.shape[:2]
+    # Slide a window over the image to extract ROIs
+    for y in range(0, height - cluster_pixel_size + 1, stride):
+        for x in range(0, width - cluster_pixel_size + 1, stride):
+            roi = slice2check_bool[y:y+cluster_pixel_size, x:x+cluster_pixel_size]
+            roi_mask = slice2check_mask_bool[y:y+cluster_pixel_size, x:x+cluster_pixel_size]
+            sumroi = np.sum(roi)
+            sumroimask = np.sum(roi_mask == 0)
+            mysums.append(sumroi)
+            if sumroi >= npixelsroi * 0.1 and sumroimask == 0:
+                # cv2.rectangle(slice2check_bool_copy, (x, y), (x + cluster_pixel_size, y + cluster_pixel_size), (0, 255, 0), 2)
+                x_pos.append(int(x+(cluster_pixel_size/2)))
+                y_pos.append(int(y+(cluster_pixel_size/2)))
+
+    z_pos = len(x_pos) * [geo.nz//2]
+
+    # # Ramdomly selects one of the possible points
+    # i,j,k = np.where(vol > denseThreshold)
+    # randInt = np.random.randint(0,i.shape[0])
+    # y_pos, x_pos, z_pos = (i[randInt],j[randInt],k[randInt])
     
-    return (x_pos, y_pos, z_pos), geo, libFiles, bound_X
+    return (x_pos, y_pos, z_pos), geo, libFiles, bound_X, slice2check_bool
 
 #-----------------------------------------------------------------------------#
 #                                                                             #
@@ -144,10 +215,10 @@ def get_XYZ_calc_positions(number_calc, cluster_size, calc_window, flags):
     z_pos = number_calc * [None]
     cluster_PDF_history = number_calc * [None]
         
-    microcalc_PDF = gauss3D(calc_window, stdev=40)
+    microcalc_PDF = gauss3D(calc_window, stdev=15)
     microcalc_PDF = 1 - ((microcalc_PDF - microcalc_PDF.min()) / (microcalc_PDF.max() - microcalc_PDF.min()))
     
-    cluster_PDF = gauss3D(cluster_size, stdev=80)
+    cluster_PDF = gauss3D(cluster_size, stdev=30)
         
     for calc_n in range(number_calc):
         
@@ -239,10 +310,20 @@ def get_calc_cluster(pathCalcifications, pathCalcificationsReport, number_calc, 
     
     
     df = pd.read_excel(pathCalcificationsReport)
-    
-    df = df[df['Type'] == 'calc']
-    df = df[(df['nVoxels'] <= 6000) & (df['nVoxels'] >= 2000)]
-         
+
+    # pathCalcifications = pathCalcifications.replace('/calc', '/cluster')
+
+    '''
+    140um to 350um on 2D FFDM
+    (0.14/0.048)**3
+    (0.35/0.048)**3
+    '''
+    df = df[df['Type'] == 'calc'] #'cluster']
+    # df = df[(df['nVoxels'] <= 387) & (df['nVoxels'] >= 3)]
+    df = df[(df['BB_CountX'] <= 8) & (df['BB_CountX'] >= 3)]
+    df = df[(df['BB_CountY'] <= 8) & (df['BB_CountY'] >= 3)]
+    df = df[(df['BB_CountZ'] <= 8) & (df['BB_CountZ'] >= 3)]
+
     rand_index = np.random.randint(0, df.shape[0], number_calc)
     
     cluster_size = np.hstack((cluster_size,np.array(number_calc)))
@@ -292,7 +373,7 @@ def get_calc_cluster(pathCalcifications, pathCalcificationsReport, number_calc, 
 def get_breast_masks(dcmFiles, patient_case, pathPatientDensity, pathLibra, pathMatlab, pathAuxLibs, flags):
     
         
-        path2write_patient_name = "{}{}{}".format(pathPatientDensity , filesep(), "/".join(patient_case.split('/')[-3:]))
+        path2write_patient_name = "{}{}{}".format(pathPatientDensity , filesep(), "/".join(patient_case.split('/')[-2:]))
         
         if makedir(path2write_patient_name):
             flag_mask_found = True
@@ -311,7 +392,7 @@ def get_breast_masks(dcmFiles, patient_case, pathPatientDensity, pathLibra, path
                 
         for idX, dcmFile in enumerate(dcmFiles):
             
-            ind = int(str(dcmFile).split('/')[-1].split('_')[1]) - 1
+            ind = int(str(dcmFile).split('/')[-1].split('_')[2].split('.')[0])
             
             if not flag_mask_found or flags['force_libra']:
             
@@ -319,11 +400,10 @@ def get_breast_masks(dcmFiles, patient_case, pathPatientDensity, pathLibra, path
                                                 
                 # As we are using DBT, we need to change some header param
                 dcmH.ImagesInAcquisition = '1'
-                dcmH.Manufacturer = 'GE MEDICAL'
+                # dcmH.Manufacturer = 'GE MEDICAL'
                 
                 if flags['vct_image']:
                     # Simulate random parameters for VCT data
-    
                     # ViewPosition
                     dcmH.add_new((0x0018,0x5101),'CS', 'CC')
                     # BodyPartThickness
@@ -339,8 +419,7 @@ def get_breast_masks(dcmFiles, patient_case, pathPatientDensity, pathLibra, path
                     # ExposureInuAs
                     dcmH.add_new((0x0018,0x1153),'DS', 86800)
                     # kvP
-                    dcmH.add_new((0x0018,0x0060),'DS', 29)
-                    
+                    dcmH.add_new((0x0018,0x0060),'DS', 29)               
                 else:
                     # BodyPartThickness
                     dcmH.add_new((0x0018,0x11A0),'FL', dcmH.BodyPartThickness)
@@ -356,26 +435,42 @@ def get_breast_masks(dcmFiles, patient_case, pathPatientDensity, pathLibra, path
                     dcmH.add_new((0x0018,0x1153),'FL', dcmH.ExposureInuAs)
                     # kvP
                     dcmH.add_new((0x0018,0x0060),'FL', dcmH.KVP)
-                
-                                
+
+                dcmH.add_new((0x0008, 0x0068), 'CS', 'FOR PROCESSING')
+
                 dcmFile_tmp = path2write_patient_name + '{}{}.dcm'.format(filesep(), ind)
                 
                 pydicom.dcmwrite(dcmFile_tmp,
                                  dcmH, 
-                                 write_like_original=True) 
-                
-                
-                subprocess.run("{} -r \"addpath(genpath('{}'));addpath('{}');run('libra_startup');libra('{}', '{}', 1);exit\" -nodisplay -nosplash".format(pathMatlab,
-                                                              pathLibra,
-                                                              pathAuxLibs,
-                                                              dcmFile_tmp,
-                                                              path2write_patient_name), shell=True)
-        
-            # Read masks from LIBRA
-            res = loadmat('{}{}Result_Images{}Masks_{}.mat'.format(path2write_patient_name, filesep(), filesep(), ind))['res']
-            
-            mask_dense[ind] = res['DenseMask'][0][0]
-            mask_breast[ind] = res['BreastMask'][0][0]
+                                 write_like_original=True)
+
+                try:
+
+                    subprocess.run("{} -r \"addpath(genpath('{}'));addpath('{}');run('libra_startup');libra('{}', '{}', 1);exit\" -nodisplay -nosplash".format(pathMatlab,
+                                                                  pathLibra,
+                                                                  pathAuxLibs,
+                                                                  dcmFile_tmp,
+                                                                  path2write_patient_name), shell=True)
+                except subprocess.CalledProcessError as e:
+                    # Handle any errors that occur during execution
+                    print("An error occurred while running the MATLAB script:")
+                    print(e)
+                except Exception as e:
+                    # Handle any other unexpected errors
+                    print("An unexpected error occurred:")
+                    print(e)
+
+            try:
+                # Read masks from LIBRA
+                res = loadmat('{}{}Result_Images{}Masks_{}.mat'.format(path2write_patient_name, filesep(), filesep(), ind))['res']
+
+                mask_dense[ind] = res['DenseMask'][0][0]
+                mask_breast[ind] = res['BreastMask'][0][0]
+
+            except Exception as e:
+                with open('localbug.txt', 'a') as file:
+                    file.write("{},\n".format(dcmFile))
+
         
         
         if not flag_mask_found:
